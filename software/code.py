@@ -1,5 +1,5 @@
-import ipaddress
 import ssl
+
 import wifi
 import socketpool
 import adafruit_requests
@@ -11,38 +11,33 @@ import adafruit_imageload
 import time
 import adafruit_il0373
 import microcontroller
-import binascii
 import alarm
 import watchdog
-import adafruit_uc8151d
 import supervisor
+import adafruit_hashlib
+
+# noinspection PyBroadException
+try:
+	from typing import Optional, Final
+except:
+	pass
 
 supervisor.runtime.autoreload = False
 
-NVM_OFFSETS = {
-	"etag": {
-		"start": 0,
-		"length": 20
-	},
-	"wake_button": {
-		"start": 20,
-		"length": 1
+class Renderer:
+	MAX_WAKE_PINS: Final[int] = 1
+	BUTTON_MAP: Final[dict[str, int]] = {
+		"A": board.D11,
+		"B": board.D12,
+		"C": board.D13
 	}
-}
 
-FORCE_RENDER = True
-
-class MagTagRenderer:
 	def __init__(self):
+		self.battery_percent = None
 		self.refresh_interval = None
 
-	def get_button_map(self):
-		raise NotImplementedError()
-
-	def get_max_wake_pins(self):
-		return None
-
-	def connect(self):
+	@staticmethod
+	def connect():
 		print("Connecting to Wi-Fi...")
 		wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"), os.getenv("CIRCUITPY_WIFI_PASSWORD"))
 		print(f"Connected ({wifi.radio.ipv4_address})")
@@ -50,16 +45,15 @@ class MagTagRenderer:
 	def build_pin_alarms(self):
 		alarms = []
 		button_count = 0
-		max_wake_pins = self.get_max_wake_pins()
-		button_map = self.get_button_map()
-		for button in button_map:
+		for button in self.BUTTON_MAP:
 			button_count = button_count + 1
-			if max_wake_pins is not None and button_count > max_wake_pins:
+			if self.MAX_WAKE_PINS is not None and button_count > self.MAX_WAKE_PINS:
 				print(f"Ignoring other buttons; too many wake pins")
 				break
 
-			pin = button_map[button]
+			pin = self.BUTTON_MAP[button]
 			print(f"Setting pin alarm for button {button} on pin {pin}")
+			# noinspection PyUnresolvedReferences
 			alarms.append(alarm.pin.PinAlarm(pin = pin, value = False, pull = True))
 
 		print(f"Waking on {len(alarms)} pin alarms")
@@ -80,6 +74,7 @@ class MagTagRenderer:
 		if seconds is not None:
 			monotonic_time = time.monotonic() + seconds
 			print(f"Setting time alarm for {monotonic_time} seconds monotonic ({seconds} seconds from now)")
+			# noinspection PyUnresolvedReferences
 			alarms.append(alarm.time.TimeAlarm(monotonic_time = monotonic_time))
 
 		print("Entering deep sleep")
@@ -89,9 +84,24 @@ class MagTagRenderer:
 		print("Got past deep sleep, somehow")
 
 	def get_battery_percent(self):
-		return None # likely overridden by a subclass, but some devices might not know
+		if self.battery_percent is None:
+			# noinspection PyBroadException
+			try:
+				from adafruit_lc709203f import LC709203F, PackSize
+				monitor = LC709203F(board.I2C())
+				# noinspection PyUnresolvedReferences
+				monitor.pack_size = PackSize.MAH500
 
-	def get_mac_id(self):
+				self.battery_percent = int(monitor.cell_percent)
+			except:
+				print("Exception connecting to LC709203F; trying MAX17048 instead")
+				import adafruit_max1704x
+				self.battery_percent = int(adafruit_max1704x.MAX17048(board.I2C()).cell_percent)
+
+		return self.battery_percent
+
+	@staticmethod
+	def get_mac_id():
 		mac_id = ""
 		for i in wifi.radio.mac_address:
 			mac_id += "%x" % i
@@ -100,7 +110,7 @@ class MagTagRenderer:
 	def build_url(self):
 		mac_id = self.get_mac_id()
 		base_url = os.getenv("IMAGE_SERVER_BASE_URL")
-		url = base_url + mac_id
+		url = base_url + mac_id + "?"
 
 		battery = self.get_battery_percent()
 		if battery is not None:
@@ -115,47 +125,28 @@ class MagTagRenderer:
 
 		return url
 
-	def get_image_bytes(self, response: adafruit_requests.Response):
-		buffer = io.BytesIO()
+	@staticmethod
+	def get_image_bytes(response: adafruit_requests.Response):
 		expected_bytes = int(response.headers["content-length"]) if "content-length" in response.headers else None
-
-		print(f"Reading response, expecting {expected_bytes} bytes")
-		payload = response.content
-		total_bytes_read = len(payload)
-		print(f"Got {total_bytes_read} bytes")
-
-		socket = response.socket
-		chunk = bytearray(1024)
-		print("Reading first chunk")
-		bytes_read = socket.recv_into(chunk)
-		print(f"Got {bytes_read} bytes")
-		total_bytes_read = 0
-		while bytes_read > 0:
-			total_bytes_read += bytes_read
-			print(f"Read {total_bytes_read} of {expected_bytes} bytes")
-			bytes_read = socket.recv_into(chunk)
-
-		print(len(chunk))
-
-		return chunk
+		total_bytes = 0
+		buffer = io.BytesIO()
+		for chunk in response.iter_content(chunk_size = 1024):
+			# noinspection PyTypeChecker
+			total_bytes += len(chunk)
+			print(f"Read {total_bytes} of {expected_bytes} bytes")
+			# noinspection PyTypeChecker
+			buffer.write(chunk)
 
 		buffer.seek(0)
 		return buffer
 
-	def get_nullable_header(self, response: adafruit_requests.Response, header: str):
+	@staticmethod
+	def get_nullable_header(response: adafruit_requests.Response, header: str):
 		return response.headers[header] if header in response.headers else None
 
-	def get_nvm_offsets(self, key):
-		if key not in NVM_OFFSETS:
-			raise Exception(f"Unknown NVM offset {key}")
-
-		return NVM_OFFSETS[key]["start"], NVM_OFFSETS[key]["start"] + NVM_OFFSETS[key]["length"]
-
-	def nvm_get(self, key, zero_is_none: bool = True):
-		start_index, end_index = self.get_nvm_offsets(key)
-
-		buffer = microcontroller.nvm[start_index:end_index]
-		assert(len(buffer) == NVM_OFFSETS[key]["length"])
+	@staticmethod
+	def get_last_rendered_etag_hash(zero_is_none: bool = True) -> Optional[bytearray]:
+		buffer = microcontroller.nvm[0:20]
 		if zero_is_none:
 			is_empty = True
 			for i in range(0, len(buffer)):
@@ -167,54 +158,32 @@ class MagTagRenderer:
 
 		return buffer
 
-	def nvm_set(self, key, buffer: bytes):
-		start_index, end_index = self.get_nvm_offsets(key)
-
-		if buffer is None:
-			print("Coercing NVM buffer to an empty byte array")
-			buffer = 0x0 * NVM_OFFSETS[key]["length"]
-
-		assert(len(buffer) == NVM_OFFSETS[key]["length"])
-
-		microcontroller.nvm[start_index:end_index] = buffer
-
-	def get_last_rendered_etag(self):
-		etag = self.nvm_get("etag")
-		if etag is not None:
-			etag = binascii.hexlify(etag).decode("ascii")
-
-		return etag
+	@staticmethod
+	def set_last_rendered_etag(etag: Optional[str]):
+		if etag is None:
+			buffer = bytearray([0x0] * 20)
+		else:
+			buffer = bytearray.fromhex(adafruit_hashlib.sha1(etag).hexdigest())
+		print(f"{buffer}, {len(buffer)}")
+		microcontroller.nvm[0:20] = buffer
 
 	def get_last_pressed_button(self):
-		button_map = self.get_button_map()
+		# noinspection PyUnresolvedReferences
 		if isinstance(alarm.wake_alarm, alarm.pin.PinAlarm):
 			print("Explicitly woken up by pin alarm")
 
-			for button in button_map:
-				if button_map[button] == alarm.wake_alarm.pin:
+			for button in self.BUTTON_MAP:
+				if self.BUTTON_MAP[button] == alarm.wake_alarm.pin:
 					return button
 
 			print(f"Woken up by pin alarm for pin {alarm.wake_alarm.pin} but not defined in button map")
 		else: # either not defined or woken up by timeout; try to get from NVM
-			print("Woken up by something other than pin alarm; checking NVM for last wake button")
-			wake_button = self.nvm_get("wake_button")
-			if wake_button is not None:
-				wake_button = wake_button.decode("ascii")
-				if wake_button not in button_map:
-					print(f"NVM references button {wake_button} as the wake button but isn't defined in button map")
-					return None
-
-				print(f"Last wake button was {wake_button}")
-				return wake_button
-
-			print(f"No wake button in NVM")
+			print("Woken up by something other than pin alarm")
 			return None
 
-	def persist_etag(self, etag: str):
-		if etag is None:
-			etag = "0000000000000000000000000000000000000000"
+	def persist_etag(self, etag: Optional[str]):
 		print(f"Persisting etag {etag}")
-		self.nvm_set("etag", binascii.unhexlify(etag))
+		self.set_last_rendered_etag(etag)
 
 	def get_etag(self, response: adafruit_requests.Response):
 		return self.get_nullable_header(response, "etag")
@@ -229,6 +198,7 @@ class MagTagRenderer:
 	def make_request(self):
 		context = ssl.create_default_context()
 		pool = socketpool.SocketPool(wifi.radio)
+		# noinspection PyTypeChecker
 		requests = adafruit_requests.Session(pool, context)
 
 		url = self.build_url()
@@ -236,16 +206,15 @@ class MagTagRenderer:
 		response = requests.get(url, timeout = 10)
 		print("Got response with headers:")
 		print(response.headers)
+
+		if response.headers["content-type"] != "image/bmp":
+			raise ValueError(f"Expected image/bmp Content-Type but got {response.headers['content-type']}")
+
 		return response
 
-	def has_etag_changed(self, response: adafruit_request.Response):
-		global FORCE_RENDER
-		if FORCE_RENDER:
-			print(f"Pretending ETag changed to force render")
-			return True, None
-
+	def has_etag_changed(self, response: adafruit_requests.Response):
 		etag = self.get_etag(response)
-		last_rendered_etag = self.get_last_rendered_etag()
+		last_rendered_etag = self.get_last_rendered_etag_hash()
 
 		if etag is None:
 			print("No etag in payload")
@@ -253,20 +222,42 @@ class MagTagRenderer:
 		elif last_rendered_etag is None:
 			print("No persisted etag")
 			return True, etag
-		elif etag != last_rendered_etag:
+		elif bytearray.fromhex(adafruit_hashlib.sha1(etag).hexdigest()) != last_rendered_etag:
 			print(f"Etag has changed: was {last_rendered_etag}, is now {etag}")
 			return True, etag
 		else:
-			assert(etag == last_rendered_etag)
+			assert(etag == last_rendered_etag, f"{etag} == {last_rendered_etag}")
 			return False, etag
 
-	def init_display(self):
-		raise NotImplementedError()
+	@staticmethod
+	def init_display():
+		displayio.release_displays()
+		spi = board.SPI()
+		epd_cs = board.D9
+		epd_dc = board.D10
+		epd_reset = None
+		epd_busy = None
 
-	def render(self, display, response: adafruit_requests.Response):
-		raise NotImplementedError()
+		# noinspection PyUnresolvedReferences
+		display_bus = displayio.FourWire(
+			spi, command = epd_dc, chip_select = epd_cs, reset = epd_reset, baudrate = 1000000
+		)
 
-	def disconnect(self):
+		time.sleep(1)
+
+		display = adafruit_il0373.IL0373(
+			display_bus,
+			width = 296,
+			height = 128,
+			rotation = 270,
+			busy_pin = epd_busy,
+			highlight_color = 0xFF0000,
+		)
+
+		return display
+
+	@staticmethod
+	def disconnect():
 		wifi.radio.enabled = False
 
 	def get_and_render(self):
@@ -285,9 +276,8 @@ class MagTagRenderer:
 				try:
 					self.connect()
 					response = self.make_request()
-					self.disconnect()
 				except Exception as e:
-					print(f"Failed making request: {e}")
+					print(f"Failed making request, retrying: {e}")
 
 			has_etag_changed, etag = self.has_etag_changed(response)
 			if has_etag_changed:
@@ -297,68 +287,17 @@ class MagTagRenderer:
 				self.render_response(display, response)
 				print("Done rendering")
 			else:
-				print(f"Not rendering; etag hasn't changed ({etag}")
+				print(f"Not rendering; etag hasn't changed ({etag})")
+
+			self.disconnect()
 
 			refresh_interval = self.get_refresh_interval(response)
 			print(f"Refresh interval: {refresh_interval}")
 
 		self.deep_sleep(15 * 60 if refresh_interval is None else refresh_interval)
 
-class AdafruitFeatherESP32S2MagTagRenderer(MagTagRenderer):
-	def __init__(self):
-		self.battery_percent = None
-
-	def get_battery_percent(self):
-		if self.battery_percent is None:
-			try:
-				from adafruit_lc709203f import LC709203F, PackSize
-				monitor = LC709203F(board.I2C())
-				monitor.pack_size = PackSize.MAH500
-
-				self.battery_percent = int(monitor.cell_percent)
-			except:
-				print("Exception connecting to LC709203F; trying MAX17048 instead")
-				import adafruit_max1704x
-				self.battery_percent = int(adafruit_max1704x.MAX17048(board.I2C()).cell_percent)
-
-		return self.battery_percent
-
-	def get_button_map(self):
-		return {
-			"A": board.D11,
-			"B": board.D12,
-			"C": board.D13
-		}
-
-	def get_max_wake_pins(self):
-		return 1
-
-	def init_display(self):
-		displayio.release_displays()
-		spi = board.SPI()
-		epd_cs = board.D9
-		epd_dc = board.D10
-		epd_reset = None
-		epd_busy = None
-
-		display_bus = displayio.FourWire(
-			spi, command = epd_dc, chip_select = epd_cs, reset = epd_reset, baudrate = 1000000
-		)
-
-		time.sleep(1)
-
-		display = adafruit_il0373.IL0373(
-			display_bus,
-			width = 296,
-			height = 128,
-			rotation = 270,
-			busy_pin = epd_busy,
-			highlight_color = 0xFF0000,
-		)
-
-		return display
-
-	def render_bitmap(self, display, bitmap, palette):
+	@staticmethod
+	def render_bitmap(display, bitmap, palette):
 		group = displayio.Group()
 		group.append(displayio.TileGrid(bitmap, pixel_shader = palette))
 		display.root_group = group
@@ -374,6 +313,7 @@ class AdafruitFeatherESP32S2MagTagRenderer(MagTagRenderer):
 			print("Filling buffer")
 			buffer = self.get_image_bytes(response)
 			print("Loading from buffer")
+			# noinspection PyTypeChecker
 			bitmap, palette = adafruit_imageload.load(buffer)
 			print("Rendering bitmap")
 			self.render_bitmap(display, bitmap, palette)
@@ -387,14 +327,5 @@ microcontroller.watchdog.timeout = 60
 microcontroller.watchdog.mode = watchdog.WatchDogMode.RESET
 microcontroller.watchdog.feed()
 
-BOARD_CLASSES = {
-	"adafruit_feather_esp32s2": AdafruitFeatherESP32S2MagTagRenderer
-}
-
-if board.board_id not in BOARD_CLASSES:
-	raise NotImplementedError(f"Board {board.board_id} not defined in BOARD_CLASSES")
-
-klass = BOARD_CLASSES[board.board_id]
-print(f"Using {klass}")
-renderer = klass()
+renderer = Renderer()
 renderer.get_and_render()
