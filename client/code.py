@@ -85,18 +85,26 @@ class Renderer:
 
 	def get_battery_percent(self):
 		if self.battery_percent is None:
-			# noinspection PyBroadException
-			try:
-				from adafruit_lc709203f import LC709203F, PackSize
-				monitor = LC709203F(board.I2C())
-				# noinspection PyUnresolvedReferences
-				monitor.pack_size = PackSize.MAH500
+			attempts = 0
+			while True:
+				attempts += 1
+				# noinspection PyBroadException
+				try:
+					from adafruit_lc709203f import LC709203F, PackSize
+					monitor = LC709203F(board.I2C())
+					# noinspection PyUnresolvedReferences
+					monitor.pack_size = PackSize.MAH500
 
-				self.battery_percent = int(monitor.cell_percent)
-			except:
-				print("Exception connecting to LC709203F; trying MAX17048 instead")
-				import adafruit_max1704x
-				self.battery_percent = int(adafruit_max1704x.MAX17048(board.I2C()).cell_percent)
+					self.battery_percent = int(monitor.cell_percent)
+					break
+				except Exception as e:
+					if attempts >= 5:
+						print("Failed to get battery percent")
+						import traceback
+						traceback.print_exception(e)
+						break
+
+					time.sleep(1)
 
 		return self.battery_percent
 
@@ -164,7 +172,6 @@ class Renderer:
 			buffer = bytearray([0x0] * 20)
 		else:
 			buffer = bytearray.fromhex(adafruit_hashlib.sha1(etag).hexdigest())
-		print(f"{buffer}, {len(buffer)}")
 		microcontroller.nvm[0:20] = buffer
 
 	def get_last_pressed_button(self):
