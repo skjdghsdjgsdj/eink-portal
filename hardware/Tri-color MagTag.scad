@@ -514,12 +514,12 @@ module button() {
 
 //color("red") screws();
 
-case();
-//buttons();
-//backplate();
-//battery_strap();
+%case();
+buttons();
+backplate();
+battery_strap();
 
-//color("#9999ff") magnets()
-//color("#ff9999") battery();
-//display();
-//color("yellow") feather();
+color("#9999ff") magnets()
+color("#ff9999") battery();
+display();
+color("yellow") feather();

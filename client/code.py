@@ -36,11 +36,10 @@ class Renderer:
 		self.battery_percent = None
 		self.refresh_interval = None
 
-	@staticmethod
-	def connect():
+	def connect(self):
 		print("Connecting to Wi-Fi...")
 		wifi.radio.connect(os.getenv("CIRCUITPY_WIFI_SSID"), os.getenv("CIRCUITPY_WIFI_PASSWORD"))
-		print(f"Connected ({wifi.radio.ipv4_address})")
+		print(f"Connected ({wifi.radio.ipv4_address}), MAC ID {self.get_mac_id()}")
 
 	def build_pin_alarms(self):
 		alarms = []
